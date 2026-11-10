@@ -1,0 +1,547 @@
+// sfvparse.nv — parsing a field value, RFC 9651 section 4.2.
+//
+// Three entry points, one per type of field: `parse_item`, `parse_list` and
+// `parse_dictionary`.  Each follows the algorithm of section 4.2 step by
+// step and fails where it fails, so a value this module reads is a value
+// every conforming parser reads, and a value it refuses is one every
+// conforming parser refuses.
+//
+// A FIELD THAT ARRIVES AS SEVERAL LINES is combined first (section 4.2,
+// step 1): the lines are joined with a comma.  `join_lines` does it.
+//
+// THE CURSOR.  A parser reads a place in the input and either moves on or
+// records the first thing that went wrong.  The place and the error live in
+// one `Cur` that every step takes by `var`; after an error each step does
+// nothing, so a function reads what it needs and the caller checks once.
+// That is one allocation for the whole parse, where a `Result` per step
+// would be three or more.  The cost is that a step after a failure answers
+// a placeholder, so a loop checks `c.err` before it uses what it just read.
+//
+// WHERE THE RFC IS LOOSE.  Section 4.2.7 says a parser SHOULD NOT fail on
+// a Byte Sequence with no `=` padding, or with non-zero bits in the unused
+// part of the last group.  This one accepts both.  It refuses padding that
+// is not at the end, more than two `=`, and a length that no encoding
+// produces.
+
+use std.bytes
+use std.list
+use std.str
+use sfvchars
+use sfvtypes
+
+// The parser's place in the input and its first error.
+struct Cur
+    src: Str
+    n: Int
+    var pos: Int
+    // The first error code, or 0 while all is well.
+    var err: Int
+    // The offset at which the first error was found.
+    var at: Int
+
+// A cursor at the start of an input.
+fn cursor(src: Str) -> Cur []
+    Cur { src: src, n: str.len(src), pos: 0, err: 0, at: 0 }
+
+// Record the first error.
+fn fail(var c: Cur, code: Int) []
+    if c.err == 0
+        c.err = code
+        c.at = c.pos
+
+// The byte at the cursor, or 0 past the end.  No rule of the grammar
+// accepts a zero byte, so the end and a zero byte are refused alike.
+fn peek(c: Cur) -> Int []
+    str.byte_at_or(c.src, c.pos, 0)
+
+// Whether the cursor is at the end of the input.
+fn at_end(c: Cur) -> Bool []
+    c.pos >= c.n
+
+// Skip spaces, `SP`.
+fn skip_sp(var c: Cur) []
+    while c.pos < c.n and str.byte_at_or(c.src, c.pos, 0) == ' '
+        c.pos = c.pos + 1
+
+// Skip optional white space, `SP` and `HTAB`.
+fn skip_ows(var c: Cur) []
+    while c.pos < c.n
+        let b = str.byte_at_or(c.src, c.pos, 0)
+        if b != ' ' and b != '\t'
+            return
+        c.pos = c.pos + 1
+
+// A placeholder to answer after a failure.
+fn nothing() -> SfvBare []
+    SfvBoolean(false)
+
+// ── Bare items ───────────────────────────────────────────────────────
+
+// An Integer or a Decimal, section 4.2.4.
+fn parse_number(var c: Cur) -> SfvBare []
+    var negative = false
+    if peek(c) == '-'
+        negative = true
+        c.pos = c.pos + 1
+    if at_end(c) or not sfvchars.is_digit(peek(c))
+        fail(var c, SFV_ERR_NUMBER)
+        return nothing()
+    var is_decimal = false
+    let start = c.pos
+    var dot = -1
+    while c.pos < c.n
+        let b = peek(c)
+        if sfvchars.is_digit(b)
+            c.pos = c.pos + 1
+        else if b == '.' and not is_decimal
+            // 12 integer digits at most.
+            if c.pos - start > 12
+                fail(var c, SFV_ERR_NUMBER)
+                return nothing()
+            is_decimal = true
+            dot = c.pos
+            c.pos = c.pos + 1
+        else
+            break
+        let len = c.pos - start
+        if not is_decimal and len > 15
+            fail(var c, SFV_ERR_NUMBER)
+            return nothing()
+        if is_decimal and len > 16
+            fail(var c, SFV_ERR_NUMBER)
+            return nothing()
+    if not is_decimal
+        var v = 0
+        for i in start..c.pos
+            v = v * 10 + (str.byte_at_or(c.src, i, '0') - '0')
+        if negative
+            return SfvInteger(0 - v)
+        return SfvInteger(v)
+    let frac = c.pos - dot - 1
+    if frac == 0 or frac > 3
+        fail(var c, SFV_ERR_NUMBER)
+        return nothing()
+    var whole = 0
+    for i in start..dot
+        whole = whole * 10 + (str.byte_at_or(c.src, i, '0') - '0')
+    var f = 0
+    for i in dot + 1..c.pos
+        f = f * 10 + (str.byte_at_or(c.src, i, '0') - '0')
+    for _ in frac..3
+        f = f * 10
+    let t = whole * 1000 + f
+    if negative
+        return SfvDecimal(0 - t)
+    SfvDecimal(t)
+
+// A String, section 4.2.5.
+fn parse_string(var c: Cur) -> SfvBare []
+    // Skip the opening quote.
+    c.pos = c.pos + 1
+    var out = ""
+    var run = c.pos
+    while c.pos < c.n
+        let b = peek(c)
+        if b == '\\'
+            out = out + str.slice(c.src, run, c.pos)
+            c.pos = c.pos + 1
+            if at_end(c)
+                fail(var c, SFV_ERR_STRING)
+                return nothing()
+            let e = peek(c)
+            if e != '"' and e != '\\'
+                fail(var c, SFV_ERR_STRING)
+                return nothing()
+            run = c.pos
+            c.pos = c.pos + 1
+        else if b == '"'
+            out = out + str.slice(c.src, run, c.pos)
+            c.pos = c.pos + 1
+            return SfvString(out)
+        else if not sfvchars.is_string_char(b)
+            fail(var c, SFV_ERR_STRING)
+            return nothing()
+        else
+            c.pos = c.pos + 1
+    fail(var c, SFV_ERR_STRING)
+    nothing()
+
+// A Token, section 4.2.6.
+fn parse_token(var c: Cur) -> SfvBare []
+    let start = c.pos
+    c.pos = c.pos + 1
+    while c.pos < c.n and sfvchars.is_token_char(peek(c))
+        c.pos = c.pos + 1
+    SfvToken(str.slice(c.src, start, c.pos))
+
+// The value of a base64 digit, or -1.
+fn b64_value(b: Int) -> Int []
+    if b >= 'A' and b <= 'Z'
+        return b - 'A'
+    if b >= 'a' and b <= 'z'
+        return b - 'a' + 26
+    if b >= '0' and b <= '9'
+        return b - '0' + 52
+    if b == '+'
+        return 62
+    if b == '/'
+        return 63
+    -1
+
+// Decode the base64 text between two offsets of `src`, or `None`.
+//
+// The alphabet is the standard one.  Up to two `=` may end the text, and how
+// many is not checked against the length: section 4.2.7 asks a parser not to
+// fail on missing padding, and the corpus accepts a short or a long run
+// too.  A `=` anywhere else is refused.  The unused bits of the last group
+// are not checked.
+fn b64_decode(src: Str, from: Int, to: Int) -> ?Bytes []
+    var end = to
+    var pads = 0
+    while end > from and str.byte_at_or(src, end - 1, 0) == '='
+        end = end - 1
+        pads = pads + 1
+    let digits = end - from
+    if pads > 2
+        return None
+    let rem = digits % 4
+    if rem == 1
+        return None
+    for i in from..end
+        if b64_value(str.byte_at_or(src, i, 0)) < 0
+            return None
+    let size = digits / 4 * 3 + (if rem == 0 then 0 else (if rem == 2 then 1 else 2))
+    var out = bytes.zeros(size)
+    var w = 0
+    var acc = 0
+    var have = 0
+    for i in from..end
+        acc = (acc << 6) | b64_value(str.byte_at_or(src, i, 0))
+        have = have + 6
+        if have >= 8
+            have = have - 8
+            out = bytes.set_u8(out, w, (acc >> have) & 255)
+            w = w + 1
+            acc = acc & ((1 << have) - 1)
+    Some(out)
+
+// A Byte Sequence, section 4.2.7.
+fn parse_binary(var c: Cur) -> SfvBare []
+    c.pos = c.pos + 1
+    let start = c.pos
+    var close = -1
+    var i = start
+    while i < c.n
+        if str.byte_at_or(c.src, i, 0) == ':'
+            close = i
+            break
+        i = i + 1
+    if close < 0
+        c.pos = c.n
+        fail(var c, SFV_ERR_BINARY)
+        return nothing()
+    match b64_decode(c.src, start, close)
+        Some(b) =>
+            c.pos = close + 1
+            SfvBinary(b)
+        None    =>
+            c.pos = start
+            fail(var c, SFV_ERR_BINARY)
+            nothing()
+
+// A Boolean, section 4.2.8.
+fn parse_boolean(var c: Cur) -> SfvBare []
+    c.pos = c.pos + 1
+    let b = peek(c)
+    if b == '1'
+        c.pos = c.pos + 1
+        return SfvBoolean(true)
+    if b == '0'
+        c.pos = c.pos + 1
+        return SfvBoolean(false)
+    fail(var c, SFV_ERR_BOOLEAN)
+    nothing()
+
+// A Date, section 4.2.9: `@` and an Integer.
+fn parse_date(var c: Cur) -> SfvBare []
+    c.pos = c.pos + 1
+    let at = c.pos
+    let v = parse_number(var c)
+    if c.err != 0
+        return nothing()
+    match v
+        SfvInteger(n) => SfvDate(n)
+        _             =>
+            c.pos = at
+            fail(var c, SFV_ERR_DATE)
+            nothing()
+
+// The value of a lower-case hexadecimal digit, or -1.
+fn hex_value(b: Int) -> Int []
+    if b >= '0' and b <= '9'
+        return b - '0'
+    if b >= 'a' and b <= 'f'
+        return b - 'a' + 10
+    -1
+
+// A Display String, section 4.2.10.
+fn parse_display(var c: Cur) -> SfvBare []
+    c.pos = c.pos + 1
+    if peek(c) != '"'
+        fail(var c, SFV_ERR_DISPLAY)
+        return nothing()
+    c.pos = c.pos + 1
+    var out = ""
+    var run = c.pos
+    while c.pos < c.n
+        let b = peek(c)
+        if b == '%'
+            out = out + str.slice(c.src, run, c.pos)
+            let hi = hex_value(str.byte_at_or(c.src, c.pos + 1, 0))
+            let lo = hex_value(str.byte_at_or(c.src, c.pos + 2, 0))
+            if hi < 0 or lo < 0
+                fail(var c, SFV_ERR_DISPLAY)
+                return nothing()
+            out = out + str.from_byte(hi * 16 + lo)
+            c.pos = c.pos + 3
+            run = c.pos
+        else if b == '"'
+            out = out + str.slice(c.src, run, c.pos)
+            c.pos = c.pos + 1
+            if not sfvchars.valid_utf8(out)
+                c.pos = c.pos - 1
+                fail(var c, SFV_ERR_DISPLAY)
+                return nothing()
+            return SfvDisplay(out)
+        else if not sfvchars.is_string_char(b)
+            fail(var c, SFV_ERR_DISPLAY)
+            return nothing()
+        else
+            c.pos = c.pos + 1
+    fail(var c, SFV_ERR_DISPLAY)
+    nothing()
+
+// A Bare Item, section 4.2.3.1: the first byte says which type follows.
+fn parse_bare(var c: Cur) -> SfvBare []
+    let b = peek(c)
+    if at_end(c)
+        fail(var c, SFV_ERR_SYNTAX)
+        return nothing()
+    if b == '-' or sfvchars.is_digit(b)
+        return parse_number(var c)
+    if b == '"'
+        return parse_string(var c)
+    if sfvchars.is_token_start(b)
+        return parse_token(var c)
+    if b == ':'
+        return parse_binary(var c)
+    if b == '?'
+        return parse_boolean(var c)
+    if b == '@'
+        return parse_date(var c)
+    if b == '%'
+        return parse_display(var c)
+    fail(var c, SFV_ERR_SYNTAX)
+    nothing()
+
+// ── Parameters, items, lists ─────────────────────────────────────────
+
+// A key, section 4.2.3.3.
+fn parse_key(var c: Cur) -> Str []
+    if at_end(c) or not sfvchars.is_key_start(peek(c))
+        fail(var c, SFV_ERR_KEY)
+        return ""
+    let start = c.pos
+    c.pos = c.pos + 1
+    while c.pos < c.n and sfvchars.is_key_char(peek(c))
+        c.pos = c.pos + 1
+    str.slice(c.src, start, c.pos)
+
+// Parameters, section 4.2.3.2.
+fn parse_params(var c: Cur) -> [SfvParam] []
+    var params: [SfvParam] = []
+    while c.pos < c.n and c.err == 0
+        if peek(c) != ';'
+            break
+        c.pos = c.pos + 1
+        skip_sp(var c)
+        let key = parse_key(var c)
+        var value = SfvBoolean(true)
+        if c.err == 0 and peek(c) == '='
+            c.pos = c.pos + 1
+            value = parse_bare(var c)
+        if c.err == 0
+            sfvtypes.param_set(var params, key, value)
+    params
+
+// An Item, section 4.2.3.
+fn parse_item_at(var c: Cur) -> SfvItem []
+    let v = parse_bare(var c)
+    let ps = parse_params(var c)
+    SfvItem { value: v, params: ps }
+
+// An Inner List, section 4.2.1.2.
+fn parse_inner(var c: Cur) -> SfvInner []
+    c.pos = c.pos + 1
+    var items: [SfvItem] = []
+    while c.pos < c.n and c.err == 0
+        skip_sp(var c)
+        if peek(c) == ')'
+            c.pos = c.pos + 1
+            let ps = parse_params(var c)
+            return SfvInner { items: items, params: ps }
+        let it = parse_item_at(var c)
+        if c.err == 0
+            list.push(items, it)
+            let b = peek(c)
+            if at_end(c) or b != ' ' and b != ')'
+                fail(var c, SFV_ERR_LIST)
+    fail(var c, SFV_ERR_LIST)
+    SfvInner { items: items, params: [] }
+
+// An Item or an Inner List, section 4.2.1.1.
+fn parse_member(var c: Cur) -> SfvMember []
+    if peek(c) == '('
+        let inl = parse_inner(var c)
+        return SfvMemberInner(inl)
+    let it = parse_item_at(var c)
+    SfvMemberItem(it)
+
+// The result of a parse, once the input is used up.
+fn done(var c: Cur) []
+    skip_sp(var c)
+    if c.err == 0 and not at_end(c)
+        fail(var c, SFV_ERR_SYNTAX)
+
+// The error a failed cursor stands for.
+fn error_of(c: Cur) -> SfvError []
+    SfvError { code: c.err, at: c.at }
+
+// Whether every byte of the input is ASCII.
+fn is_ascii(s: Str) -> Bool []
+    for i in 0..str.len(s)
+        if str.byte_at_or(s, i, 0) > 127
+            return false
+    true
+
+// Combine the lines of one field into the value to parse (section 4.2):
+// the lines joined with a comma and a space.
+//
+// ```novo
+// use sfvparse
+//
+// fn main() [io]
+//     println(sfvparse.join_lines(["a", "b;q=1"]))   // a, b;q=1
+// ```
+pub fn join_lines(lines: [Str]) -> Str []
+    str.join(lines, ", ")
+
+// Parse a field of type Item.
+//
+// Leading and trailing spaces are dropped; a tab is not a space, and the
+// empty input is an error.
+//
+// ```novo
+// use sfvparse
+// use sfvtypes
+//
+// fn main() [io]
+//     match sfvparse.parse_item("5;q=2")
+//         Ok(it) => println(string_of_int(sfvtypes.as_int(it.value) ?? -1))
+//         Err(e) => println(sfvtypes.code_message(e.code))
+// ```
+pub fn parse_item(input: Str) -> Result<SfvItem, SfvError> []
+    if not is_ascii(input)
+        return Err(SfvError { code: SFV_ERR_ASCII, at: 0 })
+    var c = cursor(input)
+    skip_sp(var c)
+    let it = parse_item_at(var c)
+    done(var c)
+    if c.err != 0
+        return Err(error_of(c))
+    Ok(it)
+
+// Parse a field of type List.
+//
+// The empty input, or one of spaces, is the empty List.
+//
+// ```novo
+// use sfvparse
+// use std.list
+//
+// fn main() [io]
+//     match sfvparse.parse_list("1, 2, (3 4)")
+//         Ok(ms) => println(string_of_int(list.len(ms)))   // 3
+//         Err(_) => println("bad")
+// ```
+pub fn parse_list(input: Str) -> Result<[SfvMember], SfvError> []
+    if not is_ascii(input)
+        return Err(SfvError { code: SFV_ERR_ASCII, at: 0 })
+    var c = cursor(input)
+    skip_sp(var c)
+    var members: [SfvMember] = []
+    while c.pos < c.n and c.err == 0
+        let m = parse_member(var c)
+        if c.err == 0
+            list.push(members, m)
+            skip_ows(var c)
+            if at_end(c)
+                break
+            if peek(c) != ','
+                fail(var c, SFV_ERR_LIST)
+            else
+                c.pos = c.pos + 1
+                skip_ows(var c)
+                if at_end(c)
+                    fail(var c, SFV_ERR_LIST)
+    done(var c)
+    if c.err != 0
+        return Err(error_of(c))
+    Ok(members)
+
+// Parse a field of type Dictionary.
+//
+// The empty input, or one of spaces, is the empty Dictionary.  A key that
+// appears twice keeps its first position and its last value.
+//
+// ```novo
+// use sfvparse
+// use std.list
+//
+// fn main() [io]
+//     match sfvparse.parse_dictionary("a=1, b, c=(x y)")
+//         Ok(es) => println(string_of_int(list.len(es)))   // 3
+//         Err(_) => println("bad")
+// ```
+pub fn parse_dictionary(input: Str) -> Result<[SfvEntry], SfvError> []
+    if not is_ascii(input)
+        return Err(SfvError { code: SFV_ERR_ASCII, at: 0 })
+    var c = cursor(input)
+    skip_sp(var c)
+    var entries: [SfvEntry] = []
+    while c.pos < c.n and c.err == 0
+        let key = parse_key(var c)
+        var m = SfvMemberItem(SfvItem { value: SfvBoolean(true), params: [] })
+        if c.err == 0
+            if peek(c) == '='
+                c.pos = c.pos + 1
+                m = parse_member(var c)
+            else
+                let ps = parse_params(var c)
+                m = SfvMemberItem(SfvItem { value: SfvBoolean(true), params: ps })
+        if c.err == 0
+            sfvtypes.dict_set(var entries, key, m)
+            skip_ows(var c)
+            if at_end(c)
+                break
+            if peek(c) != ','
+                fail(var c, SFV_ERR_LIST)
+            else
+                c.pos = c.pos + 1
+                skip_ows(var c)
+                if at_end(c)
+                    fail(var c, SFV_ERR_LIST)
+    done(var c)
+    if c.err != 0
+        return Err(error_of(c))
+    Ok(entries)

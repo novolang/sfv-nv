@@ -1,0 +1,517 @@
+// sfv_api_tests.nv — the values, the builders, the errors and the
+// serialiser's refusals.
+//
+// The corpus in `sfv_corpus_tests.nv` is the proof that parsing and writing
+// agree with RFC 9651.  This file holds what a corpus cannot say: what a
+// caller gets from each function of the API, what each error code means,
+// and where a value that cannot be written is stopped.
+
+use std.bytes
+use std.list
+use std.str
+use std.test
+use sfvchars
+use sfvparse
+use sfvtypes
+use sfvwrite
+
+// The error code a refused item parse gives, or 0.
+fn item_code(s: Str) -> Int
+    match sfvparse.parse_item(s)
+        Ok(_)  => 0
+        Err(e) => e.code
+
+fn list_code(s: Str) -> Int
+    match sfvparse.parse_list(s)
+        Ok(_)  => 0
+        Err(e) => e.code
+
+fn dict_code(s: Str) -> Int
+    match sfvparse.parse_dictionary(s)
+        Ok(_)  => 0
+        Err(e) => e.code
+
+// The offset a refused item parse stopped at, or -2.
+fn item_at(s: Str) -> Int
+    match sfvparse.parse_item(s)
+        Ok(_)  => -2
+        Err(e) => e.at
+
+// The text a value serialises to, or "!" when it is refused.
+fn item_text(v: SfvBare) -> Str
+    match sfvwrite.serialize_item(sfvtypes.item(v))
+        Ok(t)  => t
+        Err(_) => "!"
+
+fn list_text(ms: [SfvMember]) -> Str
+    match sfvwrite.serialize_list(ms)
+        Ok(t)  => t
+        Err(_) => "!"
+
+fn dict_text(es: [SfvEntry]) -> Str
+    match sfvwrite.serialize_dictionary(es)
+        Ok(t)  => t
+        Err(_) => "!"
+
+fn decimal_or(text: Str) -> Int
+    sfvtypes.decimal_from_text(text) ?? -99
+
+// ── Character classes ────────────────────────────────────────────────
+
+@test
+fn test_the_character_classes_follow_the_grammar()
+    test.case("digits and letters")
+    test.assert(sfvchars.is_digit('0') and sfvchars.is_digit('9'))
+    test.assert(not sfvchars.is_digit('/') and not sfvchars.is_digit(':'))
+    test.assert(sfvchars.is_alpha('a') and sfvchars.is_alpha('Z'))
+    test.assert(not sfvchars.is_alpha('@') and not sfvchars.is_alpha('['))
+    test.assert(sfvchars.is_lcalpha('q') and not sfvchars.is_lcalpha('Q'))
+
+    test.case("a tchar is a letter, a digit or one of fifteen marks")
+    let marks = "!#$%&'*+-.^_`|~"
+    for i in 0..str.len(marks)
+        test.assert(sfvchars.is_tchar(str.byte_at_or(marks, i, 0)))
+    test.assert(not sfvchars.is_tchar(' ') and not sfvchars.is_tchar('"'))
+    test.assert(not sfvchars.is_tchar('(') and not sfvchars.is_tchar(','))
+    test.assert(not sfvchars.is_tchar(':') and not sfvchars.is_tchar('/'))
+
+    test.case("key and token starts and continuations")
+    test.assert(sfvchars.is_key_start('a') and sfvchars.is_key_start('*'))
+    test.assert(not sfvchars.is_key_start('A') and not sfvchars.is_key_start('1'))
+    test.assert(sfvchars.is_key_char('1') and sfvchars.is_key_char('_') and sfvchars.is_key_char('-'))
+    test.assert(sfvchars.is_key_char('.') and sfvchars.is_key_char('*'))
+    test.assert(not sfvchars.is_key_char('A') and not sfvchars.is_key_char(':'))
+    test.assert(sfvchars.is_token_start('A') and sfvchars.is_token_start('*'))
+    test.assert(not sfvchars.is_token_start('1') and not sfvchars.is_token_start(':'))
+    test.assert(sfvchars.is_token_char(':') and sfvchars.is_token_char('/') and sfvchars.is_token_char('1'))
+    test.assert(not sfvchars.is_token_char(' '))
+
+    test.case("a String holds printable ASCII")
+    test.assert(sfvchars.is_string_char(' ') and sfvchars.is_string_char('~'))
+    test.assert(not sfvchars.is_string_char(0x1F) and not sfvchars.is_string_char(0x7F))
+    test.assert(sfvchars.valid_string("") and sfvchars.valid_string("a \"b\""))
+    test.assert(not sfvchars.valid_string("tab\t") and not sfvchars.valid_string("é"))
+
+@test
+fn test_keys_and_tokens_are_checked_whole()
+    test.case("keys")
+    test.assert(sfvchars.valid_key("a") and sfvchars.valid_key("*a-b_c.d*9"))
+    test.assert(not sfvchars.valid_key("") and not sfvchars.valid_key("A"))
+    test.assert(not sfvchars.valid_key("a b") and not sfvchars.valid_key("1a"))
+    test.case("tokens")
+    test.assert(sfvchars.valid_token("a") and sfvchars.valid_token("text/html:x"))
+    test.assert(sfvchars.valid_token("*"))
+    test.assert(not sfvchars.valid_token("") and not sfvchars.valid_token("1a"))
+    test.assert(not sfvchars.valid_token("a b") and not sfvchars.valid_token("a\""))
+
+@test
+fn test_utf8_is_checked_by_the_rules_of_the_standard()
+    test.case("well-formed sequences of every length")
+    test.assert(sfvchars.valid_utf8(""))
+    test.assert(sfvchars.valid_utf8("plain"))
+    test.assert(sfvchars.valid_utf8("ü"))
+    test.assert(sfvchars.valid_utf8("€"))
+    test.assert(sfvchars.valid_utf8("😀"))
+
+    test.case("a stray or truncated byte")
+    test.assert(not sfvchars.valid_utf8(str.from_byte(0x80)))
+    test.assert(not sfvchars.valid_utf8(str.from_byte(0xC3)))
+    test.assert(not sfvchars.valid_utf8(str.from_byte(0xC3) + "a"))
+    test.assert(not sfvchars.valid_utf8(str.from_byte(0xE2) + str.from_byte(0x82)))
+    test.assert(not sfvchars.valid_utf8(str.from_byte(0xE2) + "a" + "a"))
+    test.assert(not sfvchars.valid_utf8(str.from_byte(0xF0) + str.from_byte(0x9F) + str.from_byte(0x98)))
+    test.assert(not sfvchars.valid_utf8(str.from_byte(0xF0) + str.from_byte(0x9F) + "aa"))
+    test.assert(not sfvchars.valid_utf8(str.from_byte(0xFF)))
+    test.assert(not sfvchars.valid_utf8(str.from_byte(0xC0) + str.from_byte(0x80)))
+
+    test.case("an overlong form, a surrogate, a code point past U+10FFFF")
+    test.assert(not sfvchars.valid_utf8(str.from_byte(0xE0) + str.from_byte(0x80) + str.from_byte(0x80)))
+    test.assert(sfvchars.valid_utf8(str.from_byte(0xE0) + str.from_byte(0xA0) + str.from_byte(0x80)))
+    test.assert(not sfvchars.valid_utf8(str.from_byte(0xED) + str.from_byte(0xA0) + str.from_byte(0x80)))
+    test.assert(sfvchars.valid_utf8(str.from_byte(0xED) + str.from_byte(0x9F) + str.from_byte(0xBF)))
+    test.assert(not sfvchars.valid_utf8(str.from_byte(0xF0) + str.from_byte(0x80) + str.from_byte(0x80) + str.from_byte(0x80)))
+    test.assert(sfvchars.valid_utf8(str.from_byte(0xF0) + str.from_byte(0x90) + str.from_byte(0x80) + str.from_byte(0x80)))
+    test.assert(not sfvchars.valid_utf8(str.from_byte(0xF4) + str.from_byte(0x90) + str.from_byte(0x80) + str.from_byte(0x80)))
+    test.assert(sfvchars.valid_utf8(str.from_byte(0xF4) + str.from_byte(0x8F) + str.from_byte(0xBF) + str.from_byte(0xBF)))
+
+// ── Errors ───────────────────────────────────────────────────────────
+
+@test
+fn test_every_error_code_has_a_sentence()
+    test.case("each code reads differently")
+    var seen: [Str] = []
+    for code in 1..13
+        let m = sfvtypes.code_message(code)
+        test.assert(not list.contains(seen, m))
+        list.push(seen, m)
+    test.assert(sfvtypes.code_message(99) == "unknown error")
+
+    test.case("the Error impl adds the offset when there is one")
+    let e = SfvError { code: SFV_ERR_NUMBER, at: 3 }
+    test.assert(e.message() == "malformed or out-of-range number at offset 3")
+    let w = SfvError { code: SFV_ERR_UNWRITABLE, at: -1 }
+    test.assert(w.message() == "value cannot be serialised")
+
+@test
+fn test_a_parse_error_names_its_kind_and_its_place()
+    test.case("an item")
+    test.assert(item_code("") == SFV_ERR_SYNTAX)
+    test.assert(item_code("1 2") == SFV_ERR_SYNTAX)
+    test.assert(item_code("1.") == SFV_ERR_NUMBER)
+    test.assert(item_code("-") == SFV_ERR_NUMBER)
+    test.assert(item_code("1234567890123456") == SFV_ERR_NUMBER)
+    test.assert(item_code("1234567890123.5") == SFV_ERR_NUMBER)
+    test.assert(item_code("1.2345") == SFV_ERR_NUMBER)
+    test.assert(item_code("1.234567890123456") == SFV_ERR_NUMBER)
+    test.assert(item_code("\"abc") == SFV_ERR_STRING)
+    test.assert(item_code("\"a\\") == SFV_ERR_STRING)
+    test.assert(item_code("\"a\\n\"") == SFV_ERR_STRING)
+    test.assert(item_code("\"a\tb\"") == SFV_ERR_STRING)
+    test.assert(item_code(":abc") == SFV_ERR_BINARY)
+    test.assert(item_code(":a*bc:") == SFV_ERR_BINARY)
+    test.assert(item_code(":a:") == SFV_ERR_BINARY)
+    test.assert(item_code(":aa===:") == SFV_ERR_BINARY)
+    test.assert(item_code(":a=a=:") == SFV_ERR_BINARY)
+    test.assert(item_code("?2") == SFV_ERR_BOOLEAN)
+    test.assert(item_code("?") == SFV_ERR_BOOLEAN)
+    test.assert(item_code("@1.5") == SFV_ERR_DATE)
+    test.assert(item_code("%a") == SFV_ERR_DISPLAY)
+    test.assert(item_code("%\"%C3%BC\"") == SFV_ERR_DISPLAY)
+    test.assert(item_code("%\"%c3\"") == SFV_ERR_DISPLAY)
+    test.assert(item_code("%\"%zz\"") == SFV_ERR_DISPLAY)
+    test.assert(item_code("%\"abc") == SFV_ERR_DISPLAY)
+    test.assert(item_code("%\"a\tb\"") == SFV_ERR_DISPLAY)
+    test.assert(item_code("1;A=1") == SFV_ERR_KEY)
+    test.assert(item_code("1;") == SFV_ERR_KEY)
+    test.assert(item_code("é") == SFV_ERR_ASCII)
+    test.assert(item_code("(") == SFV_ERR_SYNTAX)
+
+    test.case("a list")
+    test.assert(list_code("1,") == SFV_ERR_LIST)
+    test.assert(list_code("1 2") == SFV_ERR_LIST)
+    test.assert(list_code("(1 2") == SFV_ERR_LIST)
+    test.assert(list_code("(1\t2)") == SFV_ERR_LIST)
+    test.assert(list_code("(1,2)") == SFV_ERR_LIST)
+    test.assert(list_code("é") == SFV_ERR_ASCII)
+    test.assert(list_code("a, ?x") == SFV_ERR_BOOLEAN)
+    test.assert(list_code("") == 0)
+    test.assert(list_code("   ") == 0)
+
+    test.case("a dictionary")
+    test.assert(dict_code("a=1,") == SFV_ERR_LIST)
+    test.assert(dict_code("a=1 b=2") == SFV_ERR_LIST)
+    test.assert(dict_code("A=1") == SFV_ERR_KEY)
+    test.assert(dict_code("a=") == SFV_ERR_SYNTAX)
+    test.assert(dict_code("é") == SFV_ERR_ASCII)
+    test.assert(dict_code("") == 0)
+
+    test.case("the offset is where parsing gave up")
+    test.assert(item_at("12345678901234567") == 16)
+    test.assert(item_at("\"abc") == 4)
+    test.assert(item_at("1 2") == 2)
+    test.assert(item_at("é") == 0)
+
+@test
+fn test_lines_of_one_field_are_joined_with_a_comma_and_a_space()
+    test.case("two lines")
+    test.assert(sfvparse.join_lines(["a", "b"]) == "a, b")
+    test.assert(sfvparse.join_lines(["a"]) == "a")
+    test.assert(sfvparse.join_lines([]) == "")
+
+// ── Building and reading values ──────────────────────────────────────
+
+@test
+fn test_builders_make_the_values_the_parser_makes()
+    test.case("an item and its parameters")
+    let it = sfvtypes.item_with(SfvToken("gzip"), [sfvtypes.param("q", SfvDecimal(800))])
+    test.assert(list.len(it.params) == 1)
+    test.assert(item_text(SfvToken("gzip")) == "gzip")
+    test.assert(sfvwrite.serialize_item(it) == Ok("gzip;q=0.8"))
+
+    test.case("a bare item has no parameters")
+    test.assert(list.len(sfvtypes.item(SfvInteger(1)).params) == 0)
+
+    test.case("an inner list carries its own parameters")
+    let inl = sfvtypes.inner([sfvtypes.item(SfvInteger(1)), sfvtypes.item(SfvInteger(2))],
+        [sfvtypes.param("a", SfvBoolean(true))])
+    test.assert(list_text([SfvMemberInner(inl)]) == "(1 2);a")
+
+    test.case("a list member and a dictionary entry")
+    test.assert(list_text([sfvtypes.member(SfvInteger(1)), sfvtypes.member(SfvString("x"))]) == "1, \"x\"")
+    test.assert(dict_text([sfvtypes.entry("a", SfvInteger(1)), sfvtypes.entry("b", SfvBoolean(true))]) == "a=1, b")
+
+@test
+fn test_a_repeated_key_keeps_its_place_and_takes_the_new_value()
+    test.case("parameters")
+    var ps: [SfvParam] = []
+    sfvtypes.param_set(var ps, "a", SfvInteger(1))
+    sfvtypes.param_set(var ps, "b", SfvInteger(2))
+    sfvtypes.param_set(var ps, "a", SfvInteger(3))
+    test.assert(list.len(ps) == 2)
+    test.assert(ps[0].key == "a" and sfvtypes.as_int(ps[0].value) == Some(3))
+    test.assert(ps[1].key == "b")
+    sfvtypes.param_set(var ps, "b", SfvInteger(7))
+    test.assert(list.len(ps) == 2)
+    test.assert(ps[0].key == "a" and sfvtypes.as_int(ps[0].value) == Some(3))
+    test.assert(ps[1].key == "b" and sfvtypes.as_int(ps[1].value) == Some(7))
+
+    test.case("a dictionary")
+    var es: [SfvEntry] = []
+    sfvtypes.dict_set(var es, "x", sfvtypes.member(SfvInteger(1)))
+    sfvtypes.dict_set(var es, "y", sfvtypes.member(SfvInteger(2)))
+    sfvtypes.dict_set(var es, "x", sfvtypes.member(SfvInteger(9)))
+    test.assert(dict_text(es) == "x=9, y=2")
+    sfvtypes.dict_set(var es, "y", sfvtypes.member(SfvInteger(8)))
+    test.assert(dict_text(es) == "x=9, y=8")
+
+@test
+fn test_lookups_answer_none_for_a_key_that_is_not_there()
+    test.case("parameters")
+    let ps = [sfvtypes.param("q", SfvInteger(1)), sfvtypes.param("fast", SfvBoolean(true))]
+    test.assert(sfvtypes.param_has(ps, "q") and not sfvtypes.param_has(ps, "z"))
+    test.assert(sfvtypes.as_int(sfvtypes.param_get(ps, "q") ?? SfvBoolean(false)) == Some(1))
+    test.assert(sfvtypes.param_get(ps, "z") == None)
+
+    test.case("dictionary members")
+    let es = [sfvtypes.entry("a", SfvInteger(5))]
+    match sfvtypes.dict_get(es, "a")
+        Some(SfvMemberItem(it)) => test.assert(sfvtypes.as_int(it.value) == Some(5))
+        _                       => test.fail("a is there")
+    test.assert(sfvtypes.dict_get(es, "b") == None)
+
+@test
+fn test_each_accessor_answers_only_its_own_type()
+    test.case("an Integer")
+    test.assert(sfvtypes.as_int(SfvInteger(4)) == Some(4))
+    test.assert(sfvtypes.as_int(SfvDecimal(4000)) == None)
+    test.case("a String is not a Token")
+    test.assert(sfvtypes.as_string(SfvString("s")) == Some("s"))
+    test.assert(sfvtypes.as_string(SfvToken("s")) == None)
+    test.assert(sfvtypes.as_token(SfvToken("t")) == Some("t"))
+    test.assert(sfvtypes.as_token(SfvString("t")) == None)
+    test.case("a Boolean")
+    test.assert(sfvtypes.as_bool(SfvBoolean(false)) == Some(false))
+    test.assert(sfvtypes.as_bool(SfvInteger(0)) == None)
+    test.case("bytes")
+    test.assert(sfvtypes.as_bytes(SfvBinary(bytes.from_str("ab"))) == Some(bytes.from_str("ab")))
+    test.assert(sfvtypes.as_bytes(SfvString("ab")) == None)
+    test.case("a Date and a Decimal")
+    test.assert(sfvtypes.as_date(SfvDate(77)) == Some(77))
+    test.assert(sfvtypes.as_date(SfvInteger(77)) == None)
+    test.assert(sfvtypes.as_decimal(SfvDecimal(1500)) == Some(1500))
+    test.assert(sfvtypes.as_decimal(SfvInteger(1)) == None)
+
+// ── Decimals ─────────────────────────────────────────────────────────
+
+@test
+fn test_a_decimal_string_rounds_half_to_even_at_the_third_digit()
+    test.case("exact values")
+    test.assert(decimal_or("2.5") == 2500)
+    test.assert(decimal_or("-2.5") == -2500)
+    test.assert(decimal_or("+2.5") == 2500)
+    test.assert(decimal_or("0.001") == 1)
+    test.assert(decimal_or("7") == 7000)
+    test.assert(decimal_or(".5") == 500)
+    test.assert(decimal_or("5.") == 5000)
+    test.assert(decimal_or("999999999999.999") == 999999999999999)
+
+    test.case("a tie goes to the even digit")
+    test.assert(decimal_or("0.0015") == 2)
+    test.assert(decimal_or("0.0025") == 2)
+    test.assert(decimal_or("-0.0015") == -2)
+    test.assert(decimal_or("2.0005") == 2000)
+    test.assert(decimal_or("9.9995") == 10000)
+
+    test.case("past or short of the midpoint")
+    test.assert(decimal_or("0.5015") == 502)
+    test.assert(decimal_or("0.50150001") == 502)
+    test.assert(decimal_or("0.5014999") == 501)
+    test.assert(decimal_or("0.0006") == 1)
+    test.assert(decimal_or("0.0004") == 0)
+    test.assert(decimal_or("0.0005") == 0)
+    test.assert(decimal_or("0.00000001") == 0)
+
+    test.case("an exponent moves the point")
+    test.assert(decimal_or("1e-3") == 1)
+    test.assert(decimal_or("1.5E2") == 150000)
+    test.assert(decimal_or("25e+1") == 250000)
+    test.assert(decimal_or("1e-30") == 0)
+
+    test.case("not a number, or too large")
+    test.assert(decimal_or("") == -99)
+    test.assert(decimal_or("-") == -99)
+    test.assert(decimal_or(".") == -99)
+    test.assert(decimal_or("abc") == -99)
+    test.assert(decimal_or("1x") == -99)
+    test.assert(decimal_or("1e") == -99)
+    test.assert(decimal_or("1e-") == -99)
+    test.assert(decimal_or("1e+x") == -99)
+    test.assert(decimal_or("1e9999") == -99)
+    test.assert(decimal_or("1e30") == -99)
+    test.assert(decimal_or("1000000000000") == -99)
+    test.assert(decimal_or("999999999999.9996") == -99)
+    test.assert(decimal_or("1234567890123456.7891") == -99)
+    test.assert(decimal_or("1e399") == -99)
+
+@test
+fn test_a_float_is_read_as_its_shortest_decimal()
+    test.case("the double 0.5015 is below the midpoint, the decimal 0.5015 is on it")
+    test.assert(sfvtypes.decimal_from_float(0.5015) == Some(502))
+    test.assert(sfvtypes.decimal_from_float(0.5035) == Some(504))
+    test.assert(sfvtypes.decimal_from_float(2.0005) == Some(2000))
+    test.assert(sfvtypes.decimal_from_float(-1.25) == Some(-1250))
+    test.assert(sfvtypes.decimal_from_float(3.0) == Some(3000))
+    test.case("infinity and a float that is too large")
+    test.assert(sfvtypes.decimal_from_float(1.0e300 * 1.0e300) == None)
+    test.assert(sfvtypes.decimal_from_float(1.0e15) == None)
+    test.case("a Bare Item")
+    test.assert(sfvtypes.decimal(2.5) == Some(SfvDecimal(2500)))
+    test.assert(sfvtypes.decimal(1.0e15) == None)
+
+// ── The serialiser's refusals and forms ──────────────────────────────
+
+@test
+fn test_a_decimal_is_written_with_one_to_three_fraction_digits()
+    test.case("trailing zeros are trimmed down to one digit")
+    test.assert(sfvwrite.decimal_to_str(2500) == "2.5")
+    test.assert(sfvwrite.decimal_to_str(2000) == "2.0")
+    test.assert(sfvwrite.decimal_to_str(2050) == "2.05")
+    test.assert(sfvwrite.decimal_to_str(2005) == "2.005")
+    test.assert(sfvwrite.decimal_to_str(1) == "0.001")
+    test.assert(sfvwrite.decimal_to_str(0) == "0.0")
+    test.assert(sfvwrite.decimal_to_str(-2500) == "-2.5")
+    test.assert(sfvwrite.decimal_to_str(999999999999999) == "999999999999.999")
+
+@test
+fn test_values_beyond_fifteen_digits_are_not_written()
+    test.case("Integer, Decimal and Date")
+    test.assert(item_text(SfvInteger(999999999999999)) == "999999999999999")
+    test.assert(item_text(SfvInteger(-999999999999999)) == "-999999999999999")
+    test.assert(item_text(SfvInteger(1000000000000000)) == "!")
+    test.assert(item_text(SfvInteger(-1000000000000000)) == "!")
+    test.assert(item_text(SfvDecimal(1000000000000000)) == "!")
+    test.assert(item_text(SfvDate(1000000000000000)) == "!")
+    test.assert(item_text(SfvDate(-62135596800)) == "@-62135596800")
+
+@test
+fn test_strings_tokens_and_display_strings_are_checked_before_they_are_written()
+    test.case("a String escapes the quote and the backslash")
+    test.assert(item_text(SfvString("a\"b\\c")) == "\"a\\\"b\\\\c\"")
+    test.assert(item_text(SfvString("")) == "\"\"")
+    test.assert(item_text(SfvString("tab\t")) == "!")
+    test.assert(item_text(SfvString("é")) == "!")
+
+    test.case("a Token must be a token")
+    test.assert(item_text(SfvToken("text/html")) == "text/html")
+    test.assert(item_text(SfvToken("")) == "!")
+    test.assert(item_text(SfvToken("1a")) == "!")
+    test.assert(item_text(SfvToken("a b")) == "!")
+
+    test.case("a Display String writes everything but printable ASCII as hex")
+    test.assert(item_text(SfvDisplay("füü")) == "%\"f%c3%bc%c3%bc\"")
+    test.assert(item_text(SfvDisplay("50% \"off\"")) == "%\"50%25 %22off%22\"")
+    test.assert(item_text(SfvDisplay("a\tb")) == "%\"a%09b\"")
+    test.assert(item_text(SfvDisplay("a" + str.from_byte(0x7F))) == "%\"a%7f\"")
+    test.assert(item_text(SfvDisplay("~ ")) == "%\"~ \"")
+    test.assert(item_text(SfvDisplay("")) == "%\"\"")
+    test.assert(item_text(SfvDisplay(str.from_byte(0xC3))) == "!")
+
+    test.case("a Byte Sequence is padded base64, and the Booleans")
+    test.assert(item_text(SfvBinary(bytes.from_str("hello"))) == ":aGVsbG8=:")
+    test.assert(item_text(SfvBinary(bytes.zeros(0))) == "::")
+    test.assert(item_text(SfvBoolean(true)) == "?1")
+    test.assert(item_text(SfvBoolean(false)) == "?0")
+
+@test
+fn test_parameters_and_members_that_cannot_be_written_stop_the_whole_value()
+    test.case("a parameter")
+    let bad_key = sfvtypes.item_with(SfvInteger(1), [sfvtypes.param("A", SfvInteger(1))])
+    test.assert(sfvwrite.serialize_item(bad_key) == Err(SfvError { code: SFV_ERR_UNWRITABLE, at: -1 }))
+    let bad_value = sfvtypes.item_with(SfvInteger(1), [sfvtypes.param("a", SfvToken("1x"))])
+    test.assert(sfvwrite.serialize_item(bad_value) == Err(SfvError { code: SFV_ERR_UNWRITABLE, at: -1 }))
+    let bad_bare = sfvtypes.item_with(SfvToken("1x"), [])
+    test.assert(sfvwrite.serialize_item(bad_bare) == Err(SfvError { code: SFV_ERR_UNWRITABLE, at: -1 }))
+    let off = sfvtypes.item_with(SfvInteger(1), [sfvtypes.param("a", SfvBoolean(false))])
+    test.assert(sfvwrite.serialize_item(off) == Ok("1;a=?0"))
+
+    test.case("an inner list")
+    let bad_item = sfvtypes.inner([sfvtypes.item(SfvToken("1x"))], [])
+    test.assert(list_text([SfvMemberInner(bad_item)]) == "!")
+    let bad_params = sfvtypes.inner([], [sfvtypes.param("A", SfvInteger(1))])
+    test.assert(list_text([SfvMemberInner(bad_params)]) == "!")
+    test.assert(list_text([SfvMemberInner(sfvtypes.inner([], []))]) == "()")
+
+    test.case("a list")
+    test.assert(list_text([]) == "")
+    test.assert(list_text([sfvtypes.member(SfvInteger(1)), sfvtypes.member(SfvToken("1x"))]) == "!")
+
+    test.case("a dictionary")
+    test.assert(dict_text([]) == "")
+    test.assert(dict_text([sfvtypes.entry("A", SfvInteger(1))]) == "!")
+    test.assert(dict_text([sfvtypes.entry("a", SfvToken("1x"))]) == "!")
+    let flag = SfvEntry { key: "f",
+        member: SfvMemberItem(sfvtypes.item_with(SfvBoolean(true), [sfvtypes.param("x", SfvInteger(1))])) }
+    test.assert(dict_text([flag]) == "f;x=1")
+    let bad_flag = SfvEntry { key: "f",
+        member: SfvMemberItem(sfvtypes.item_with(SfvBoolean(true), [sfvtypes.param("X", SfvInteger(1))])) }
+    test.assert(dict_text([bad_flag]) == "!")
+    let list_member = SfvEntry { key: "l",
+        member: SfvMemberInner(sfvtypes.inner([sfvtypes.item(SfvInteger(1))], [])) }
+    test.assert(dict_text([list_member]) == "l=(1)")
+    let bad_list_member = SfvEntry { key: "l",
+        member: SfvMemberInner(sfvtypes.inner([sfvtypes.item(SfvToken("1x"))], [])) }
+    test.assert(dict_text([bad_list_member]) == "!")
+
+// ── Reading ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_byte_sequence_is_read_without_fussing_over_padding()
+    test.case("padded, unpadded and over-padded all give the same bytes")
+    for text in [":aGVsbG8=:", ":aGVsbG8:", ":aGVsbG8==:", ":aGVsbG9=:"]
+        match sfvparse.parse_item(text)
+            Ok(it) => test.assert(list.len(bytes.to_byte_list(sfvtypes.as_bytes(it.value) ?? bytes.zeros(0))) == 5)
+            Err(_) => test.fail("refused " + text)
+
+    test.case("every length of final group")
+    for text in [":YQ==:", ":YWI=:", ":YWJj:", ":YQ:", ":YWI:"]
+        test.assert(item_code(text) == 0)
+    test.assert(item_code(":Y:") == SFV_ERR_BINARY)
+    test.assert(item_code(":YQ===:") == SFV_ERR_BINARY)
+    test.assert(item_code(":Y+/9:") == 0)
+
+@test
+fn test_dictionaries_and_parameters_keep_first_position_and_last_value()
+    test.case("a repeated key in a dictionary")
+    match sfvparse.parse_dictionary("a=1, b=2, a=3")
+        Ok(es) =>
+            test.assert(list.len(es) == 2)
+            test.assert(es[0].key == "a")
+            match es[0].member
+                SfvMemberItem(it) => test.assert(sfvtypes.as_int(it.value) == Some(3))
+                _                 => test.fail("an item")
+        Err(_) => test.fail("parsed")
+
+    test.case("a repeated parameter")
+    match sfvparse.parse_item("1;a=1;b=2;a=3")
+        Ok(it) =>
+            test.assert(list.len(it.params) == 2)
+            test.assert(it.params[0].key == "a" and sfvtypes.as_int(it.params[0].value) == Some(3))
+        Err(_) => test.fail("parsed")
+
+@test
+fn test_a_value_written_is_a_value_read_back()
+    test.case("every type, with parameters, in a list")
+    let ms = [
+        sfvtypes.member(SfvInteger(-42)),
+        SfvMemberItem(sfvtypes.item_with(SfvDecimal(-1500), [sfvtypes.param("p", SfvString("q\"r"))])),
+        sfvtypes.member(SfvToken("a/b:c")),
+        sfvtypes.member(SfvBinary(bytes.from_str("xyz"))),
+        sfvtypes.member(SfvBoolean(false)),
+        sfvtypes.member(SfvDate(1659578233)),
+        sfvtypes.member(SfvDisplay("naïve")),
+        SfvMemberInner(sfvtypes.inner([sfvtypes.item(SfvInteger(1))], [sfvtypes.param("k", SfvBoolean(true))]))]
+    let text = list_text(ms)
+    test.assert(text != "!")
+    match sfvparse.parse_list(text)
+        Ok(back) => test.assert(list_text(back) == text)
+        Err(_)   => test.fail("the text was refused")

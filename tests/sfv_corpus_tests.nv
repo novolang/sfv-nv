@@ -1,0 +1,427 @@
+// sfv_corpus_tests.nv — the httpwg structured-field-tests corpus.
+//
+// The files under `tests/data/` are the test suite of the HTTP Working
+// Group's structured-field-tests repository, taken at the commit named in
+// `tests/data/SOURCE.txt`.  Every record in every file is run, and the
+// harness counts the records it runs, so the totals can be read off the
+// output rather than trusted.
+//
+// A record has a header type, the field lines as received, and the value a
+// conforming parser reads from them.  Three things are checked for each:
+//
+//   1. The parse.  A record marked `must_fail` must be refused.  A record
+//      marked `can_fail` may be refused or accepted, and when it is
+//      accepted the value must still be the expected one.  Any other record
+//      must parse to the expected value.
+//   2. The serialisation of the expected value, which must be the record's
+//      `canonical` form, or its `raw` form when there is none.  The
+//      `serialisation-tests` files carry no `raw`: they are values to
+//      write, some of which must be refused.
+//   3. The parse of the canonical form, which must give the expected value
+//      back.
+//
+// A value is compared as text.  `show_item` and its relatives write a
+// value as a string that names the type of every bare item, so two values
+// are equal exactly when their texts are.  The expected value is read out
+// of the JSON into the same types first, so the comparison is between two
+// `sfvtypes` values and not between a value and a hand-written string.
+
+use std.bytes
+use std.fs
+use std.json
+use std.list
+use std.str
+use std.test
+use sfvparse
+use sfvtypes
+use sfvwrite
+
+// ── Showing a value ──────────────────────────────────────────────────
+
+fn show_bare(v: SfvBare) -> Str
+    match v
+        SfvInteger(n) => "int:" + str.from_int(n)
+        SfvDecimal(t) => "dec:" + str.from_int(t)
+        SfvString(s)  => "str:" + s
+        SfvToken(s)   => "tok:" + s
+        SfvBinary(b)  => "bin:" + bytes.to_hex(b)
+        SfvBoolean(b) => "bool:" + str.from_bool(b)
+        SfvDate(n)    => "date:" + str.from_int(n)
+        SfvDisplay(s) => "disp:" + bytes.to_hex(bytes.from_str(s))
+
+fn show_params(ps: [SfvParam]) -> Str
+    var out = ""
+    for p in ps
+        out = out + ";" + p.key + "=" + show_bare(p.value)
+    out
+
+fn show_item(it: SfvItem) -> Str
+    "(" + show_bare(it.value) + show_params(it.params) + ")"
+
+fn show_inner(inl: SfvInner) -> Str
+    var out = "["
+    for it in inl.items
+        out = out + show_item(it) + " "
+    out + "]" + show_params(inl.params)
+
+fn show_member(m: SfvMember) -> Str
+    match m
+        SfvMemberItem(it)   => show_item(it)
+        SfvMemberInner(inl) => show_inner(inl)
+
+fn show_list(ms: [SfvMember]) -> Str
+    var out = ""
+    for m in ms
+        out = out + show_member(m) + ","
+    out
+
+fn show_dict(es: [SfvEntry]) -> Str
+    var out = ""
+    for e in es
+        out = out + e.key + "=" + show_member(e.member) + ","
+    out
+
+// ── Reading the expected value out of the JSON ───────────────────────
+
+// The value of a base32 digit (RFC 4648 section 6), or -1.
+fn b32_value(b: Int) -> Int
+    if b >= 'A' and b <= 'Z'
+        return b - 'A'
+    if b >= '2' and b <= '7'
+        return b - '2' + 26
+    -1
+
+// Base32 text to bytes; the corpus writes Byte Sequences that way.
+fn base32(s: Str) -> Bytes
+    var out: [Int] = []
+    var acc = 0
+    var have = 0
+    for i in 0..str.len(s)
+        let v = b32_value(str.byte_at_or(s, i, 0))
+        if v >= 0
+            acc = (acc << 5) | v
+            have = have + 5
+            if have >= 8
+                have = have - 8
+                list.push(out, (acc >> have) & 255)
+                acc = acc & ((1 << have) - 1)
+    bytes.from_byte_list(out)
+
+// A JSON number as a Bare Item: a point or an exponent makes it a Decimal,
+// read from the digits as written; anything else is an Integer.  `None`
+// when the number is a Decimal beyond 12 integer digits.
+fn number_of(j: JsonValueH) -> ?SfvBare
+    let text = json.stringify(j)
+    if str.contains(text, ".") or str.contains(text, "e") or str.contains(text, "E")
+        match sfvtypes.decimal_from_text(text)
+            Some(t) =>
+                return Some(SfvDecimal(t))
+            None    =>
+                return None
+    Some(SfvInteger(str.to_int(text) ?? 0))
+
+// A JSON value as a Bare Item, or `None` when it names a Decimal that has
+// no representation.
+fn bare_of(j: JsonValueH) -> ?SfvBare
+    let kind = json.type_of(j)
+    if kind == "number"
+        return number_of(j)
+    if kind == "string"
+        return Some(SfvString(json.to_str(j) ?? ""))
+    if kind == "boolean"
+        return Some(SfvBoolean(json.to_bool(j) ?? false))
+    let tag = json.get_str(j, "__type") ?? ""
+    let inner = json.get(j, "value")
+    if tag == "token"
+        return Some(SfvToken(json.get_str(j, "value") ?? ""))
+    if tag == "binary"
+        return Some(SfvBinary(base32(json.get_str(j, "value") ?? "")))
+    if tag == "date"
+        return Some(SfvDate(json.get_int(j, "value") ?? 0))
+    if tag == "displaystring"
+        return Some(SfvDisplay(json.get_str(j, "value") ?? ""))
+    None
+
+fn params_of(j: JsonValueH) -> ?[SfvParam]
+    var ps: [SfvParam] = []
+    for i in 0..(json.len(j) ?? 0)
+        match json.index(j, i)
+            None       =>
+                return None
+            Some(pair) =>
+                let key = json.to_str(json.index(pair, 0) ?? json.null()) ?? ""
+                match bare_of(json.index(pair, 1) ?? json.null())
+                    None    =>
+                        return None
+                    Some(v) => sfvtypes.param_set(var ps, key, v)
+    Some(ps)
+
+fn item_of(j: JsonValueH) -> ?SfvItem
+    match bare_of(json.index(j, 0) ?? json.null())
+        None    => None
+        Some(v) =>
+            match params_of(json.index(j, 1) ?? json.null())
+                None     => None
+                Some(ps) => Some(SfvItem { value: v, params: ps })
+
+fn inner_of(j: JsonValueH) -> ?SfvInner
+    let items = json.index(j, 0) ?? json.null()
+    var out: [SfvItem] = []
+    for i in 0..(json.len(items) ?? 0)
+        match item_of(json.index(items, i) ?? json.null())
+            None     =>
+                return None
+            Some(it) => list.push(out, it)
+    match params_of(json.index(j, 1) ?? json.null())
+        None     => None
+        Some(ps) => Some(SfvInner { items: out, params: ps })
+
+// A List member: an Inner List when the first element is an array of
+// items, otherwise an Item.
+fn member_of(j: JsonValueH) -> ?SfvMember
+    let first = json.index(j, 0) ?? json.null()
+    if json.type_of(first) == "array"
+        match inner_of(j)
+            None      =>
+                return None
+            Some(inl) =>
+                return Some(SfvMemberInner(inl))
+    match item_of(j)
+        None     => None
+        Some(it) => Some(SfvMemberItem(it))
+
+fn list_of(j: JsonValueH) -> ?[SfvMember]
+    var out: [SfvMember] = []
+    for i in 0..(json.len(j) ?? 0)
+        match member_of(json.index(j, i) ?? json.null())
+            None    =>
+                return None
+            Some(m) => list.push(out, m)
+    Some(out)
+
+fn dict_of(j: JsonValueH) -> ?[SfvEntry]
+    var out: [SfvEntry] = []
+    for i in 0..(json.len(j) ?? 0)
+        let pair = json.index(j, i) ?? json.null()
+        let key = json.to_str(json.index(pair, 0) ?? json.null()) ?? ""
+        match member_of(json.index(pair, 1) ?? json.null())
+            None    =>
+                return None
+            Some(m) => sfvtypes.dict_set(var out, key, m)
+    Some(out)
+
+// ── One record ───────────────────────────────────────────────────────
+
+// The strings of a JSON array of strings.
+fn strings_of(j: ?JsonValueH) -> [Str]
+    var out: [Str] = []
+    match j
+        None    => out
+        Some(a) =>
+            for i in 0..(json.len(a) ?? 0)
+                list.push(out, json.to_str(json.index(a, i) ?? json.null()) ?? "")
+            out
+
+// The outcome of one record: "" when it passed, else a line naming it.
+//
+// `kind` is the counter's name for the record, written to `tally`.
+fn run_record(rec: JsonValueH, var tally: [Int]) -> Str [io]
+    let name = json.get_str(rec, "name") ?? "?"
+    let header = json.get_str(rec, "header_type") ?? "?"
+    let must_fail = json.get_bool(rec, "must_fail") ?? false
+    let can_fail = json.get_bool(rec, "can_fail") ?? false
+    let raw = strings_of(json.get(rec, "raw"))
+    let has_raw = json.get(rec, "raw") != None
+    let canon_list = strings_of(json.get(rec, "canonical"))
+    let has_canon = json.get(rec, "canonical") != None
+    let expected = json.get(rec, "expected")
+
+    // The canonical form: `canonical`, else `raw`, else nothing.
+    var canonical = ""
+    var has_form = false
+    if has_canon
+        has_form = true
+        if list.len(canon_list) > 0
+            canonical = canon_list[0]
+    else if has_raw
+        has_form = true
+        canonical = str.join(raw, ", ")
+        if list.len(raw) == 1
+            canonical = raw[0]
+        if list.len(raw) == 0
+            canonical = ""
+
+    // The value the record expects, as text, and the same value serialised.
+    var want = ""
+    var written = ""
+    var write_failed = false
+    var value_unreadable = false
+    match expected
+        None    =>
+            want = ""
+        Some(e) =>
+            if header == "item"
+                match item_of(e)
+                    None     =>
+                        value_unreadable = true
+                    Some(it) =>
+                        want = show_item(it)
+                        match sfvwrite.serialize_item(it)
+                            Ok(t)  =>
+                                written = t
+                            Err(_) =>
+                                write_failed = true
+            else if header == "list"
+                match list_of(e)
+                    None     =>
+                        value_unreadable = true
+                    Some(ms) =>
+                        want = show_list(ms)
+                        match sfvwrite.serialize_list(ms)
+                            Ok(t)  =>
+                                written = t
+                            Err(_) =>
+                                write_failed = true
+            else
+                match dict_of(e)
+                    None     =>
+                        value_unreadable = true
+                    Some(es) =>
+                        want = show_dict(es)
+                        match sfvwrite.serialize_dictionary(es)
+                            Ok(t)  =>
+                                written = t
+                            Err(_) =>
+                                write_failed = true
+
+    // A record with no `raw` is a serialisation record.
+    if not has_raw
+        tally[2] = tally[2] + 1
+        if must_fail
+            if write_failed or value_unreadable
+                return ""
+            return name + ": a value that cannot be written was written as " + written
+        if write_failed or value_unreadable
+            return name + ": the value could not be written"
+        if written != canonical
+            return name + ": wrote `" + written + "`, wanted `" + canonical + "`"
+        return ""
+
+    // The parse of the lines as received.
+    let joined = sfvparse.join_lines(raw)
+    var parsed = ""
+    var parse_failed = false
+    if header == "item"
+        match sfvparse.parse_item(joined)
+            Ok(it) =>
+                parsed = show_item(it)
+            Err(_) =>
+                parse_failed = true
+    else if header == "list"
+        match sfvparse.parse_list(joined)
+            Ok(ms) =>
+                parsed = show_list(ms)
+            Err(_) =>
+                parse_failed = true
+    else
+        match sfvparse.parse_dictionary(joined)
+            Ok(es) =>
+                parsed = show_dict(es)
+            Err(_) =>
+                parse_failed = true
+
+    if must_fail
+        tally[0] = tally[0] + 1
+        if parse_failed
+            return ""
+        return name + ": parsed, and must not have: " + parsed
+    if parse_failed
+        if can_fail
+            tally[3] = tally[3] + 1
+            println("  can_fail, refused: " + name)
+            return ""
+        return name + ": refused `" + joined + "`"
+    tally[1] = tally[1] + 1
+    if parsed != want
+        return name + ": parsed to " + parsed + ", wanted " + want
+    if value_unreadable
+        return name + ": expected value unreadable"
+    if write_failed
+        return name + ": the expected value could not be written"
+    if has_form and written != canonical
+        return name + ": wrote `" + written + "`, wanted `" + canonical + "`"
+    ""
+
+// Run every record of one file; answer the failures.
+//
+// `tally` counts, in order: records that must fail and did, records that
+// parsed to the expected value, serialisation records, and `can_fail`
+// records that were refused.
+fn run_file(path: Str, var tally: [Int]) -> [Str] [io, fs]
+    var bad: [Str] = []
+    match fs.read(path)
+        None       => list.push(bad, path + ": cannot be read")
+        Some(text) =>
+            match json.parse(text)
+                None      => list.push(bad, path + ": is not JSON")
+                Some(doc) =>
+                    for i in 0..(json.len(doc) ?? 0)
+                        match json.index(doc, i)
+                            None      => list.push(bad, path + ": record missing")
+                            Some(rec) =>
+                                let r = run_record(rec, var tally)
+                                tally[4] = tally[4] + 1
+                                if r != ""
+                                    list.push(bad, path + ": " + r)
+    bad
+
+fn run_files(files: [Str], dir: Str, label: Str) [io, fs]
+    test.case(label)
+    var tally: [Int] = [0, 0, 0, 0, 0]
+    var bad: [Str] = []
+    for f in files
+        for b in run_file("tests/data/" + dir + f + ".json", var tally)
+            list.push(bad, b)
+    println("${label}: ${tally[4]} records, ${tally[0]} refused as required, ${tally[1]} parsed to the expected value, ${tally[2]} serialisation records, ${tally[3]} can_fail refused")
+    for b in bad
+        println("  FAIL " + b)
+    test.assert_true(list.len(bad) == 0, "${list.len(bad)} records failed")
+
+@test
+fn test_the_hand_written_files() [io, fs]
+    run_files(["binary",
+        "boolean",
+        "date",
+        "dictionary",
+        "display-string",
+        "examples",
+        "item",
+        "list",
+        "listlist",
+        "number",
+        "param-dict",
+        "param-list",
+        "param-listlist",
+        "string",
+        "token"],
+    "", "hand-written files")
+
+@test
+fn test_the_generated_numbers_strings_and_tokens() [io, fs]
+    run_files(["number-generated", "string-generated", "token-generated"],
+        "",
+        "generated numbers, strings, tokens")
+
+@test
+fn test_the_generated_keys() [io, fs]
+    run_files(["key-generated"], "", "generated keys")
+
+@test
+fn test_the_large_lists() [io, fs]
+    run_files(["large-generated"], "", "large lists")
+
+@test
+fn test_the_serialisation_files() [io, fs]
+    run_files(["number", "key-generated", "string-generated", "token-generated"],
+        "serialisation-tests/",
+        "serialisation files")

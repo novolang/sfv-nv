@@ -1,0 +1,424 @@
+// sfvtypes.nv — the values of RFC 9651, the errors, and what builds them.
+//
+// A Structured Field Value is one of three shapes.  An Item is a bare
+// value with parameters.  A List is a sequence of members, each an Item or
+// an Inner List (a parenthesised sequence of Items that carries parameters
+// of its own).  A Dictionary is an ordered sequence of named members.
+// Parameters are an ordered sequence of named bare values.
+//
+// A Bare Item is one of eight types.  They are an enum here, and the
+// variants carry the prefix `Sfv` because a variant is constructed by name
+// across a whole assembly.
+//
+// A DECIMAL IS AN INTEGER NUMBER OF THOUSANDTHS.  Section 3.3.2 gives a
+// Decimal at most 12 integer digits and at most 3 fraction digits, which is
+// an integer of at most 15 digits scaled by 1000.  Held that way, `2.5` is
+// `2500` and every Decimal compares and serialises exactly; a `Float`
+// cannot hold `0.1` exactly and would put a rounding rule into every
+// comparison.  `decimal_from_float` and `decimal_from_text` are the doors
+// from a number or a decimal string, with the rounding of section 4.1.5.
+//
+// A DICTIONARY AND A PARAMETER LIST ARE ORDERED LISTS OF PAIRS, not maps.
+// The order is part of the value: it is the order they serialise in.  A
+// key that appears twice in the input keeps its first position and takes
+// its last value (sections 4.2.2 and 4.2.3.2); `dict_set` and `param_set`
+// do the same.
+
+use std.bytes
+use std.list
+use std.str
+
+// ── Errors ───────────────────────────────────────────────────────────
+
+// Parsing failed because the input ended, or continued, where the
+// grammar allows neither.
+pub const SFV_ERR_SYNTAX = 1
+// A number is malformed or out of range: no digit, too many digits, a
+// trailing `.`, more than 3 fraction digits.
+pub const SFV_ERR_NUMBER = 2
+// A String is unterminated, holds a byte outside printable ASCII, or
+// escapes a byte other than `"` and `\`.
+pub const SFV_ERR_STRING = 3
+// A Token does not start with a letter or `*`.
+pub const SFV_ERR_TOKEN = 4
+// A Byte Sequence is not terminated by a colon or holds a byte outside the
+// base64 alphabet.
+pub const SFV_ERR_BINARY = 5
+// A Boolean is not `?0` or `?1`.
+pub const SFV_ERR_BOOLEAN = 6
+// A Date is not an integer.
+pub const SFV_ERR_DATE = 7
+// A Display String is not `%"`, has an escape that is not two lower-case
+// hexadecimal digits, or does not decode to well-formed UTF-8.
+pub const SFV_ERR_DISPLAY = 8
+// A key is empty or has a byte outside the key grammar.
+pub const SFV_ERR_KEY = 9
+// A List, an Inner List or a Dictionary is not separated by commas or
+// spaces as the grammar says, or ends with a comma.
+pub const SFV_ERR_LIST = 10
+// The field value holds a byte outside the ASCII range.
+pub const SFV_ERR_ASCII = 11
+// Serialising: a value cannot be written, because an Integer, Decimal or
+// Date is beyond 15 digits, a String holds a byte outside printable ASCII,
+// a Token or a key breaks the grammar, or a Display String is not UTF-8.
+pub const SFV_ERR_UNWRITABLE = 12
+
+// What went wrong, and where.
+//
+// `code` is one of the `SFV_ERR_` constants, and `at` is the byte offset in
+// the input that parsing reached when it gave up.  A serialisation error
+// has `at` -1.
+pub struct SfvError
+    code: Int
+    at: Int
+
+// A sentence for an error code, for a log line.
+pub fn code_message(code: Int) -> Str []
+    if code == SFV_ERR_SYNTAX
+        return "unexpected character, or input ended early"
+    if code == SFV_ERR_NUMBER
+        return "malformed or out-of-range number"
+    if code == SFV_ERR_STRING
+        return "malformed String"
+    if code == SFV_ERR_TOKEN
+        return "malformed Token"
+    if code == SFV_ERR_BINARY
+        return "malformed Byte Sequence"
+    if code == SFV_ERR_BOOLEAN
+        return "malformed Boolean"
+    if code == SFV_ERR_DATE
+        return "malformed Date"
+    if code == SFV_ERR_DISPLAY
+        return "malformed Display String"
+    if code == SFV_ERR_KEY
+        return "malformed key"
+    if code == SFV_ERR_LIST
+        return "malformed List, Inner List or Dictionary"
+    if code == SFV_ERR_ASCII
+        return "field value is not ASCII"
+    if code == SFV_ERR_UNWRITABLE
+        return "value cannot be serialised"
+    "unknown error"
+
+impl Error for SfvError
+    // The sentence for the error's code, with the offset when there is one.
+    fn message(self) -> Str
+        if self.at < 0
+            return code_message(self.code)
+        code_message(self.code) + " at offset " + str.from_int(self.at)
+
+// ── Values ───────────────────────────────────────────────────────────
+
+// A Bare Item, section 3.3.
+pub enum SfvBare
+    // An Integer: up to 15 digits, so -999999999999999 to 999999999999999.
+    SfvInteger(n: Int)
+    // A Decimal as thousandths: `2500` is 2.5.
+    SfvDecimal(thousandths: Int)
+    // A String: printable ASCII.
+    SfvString(s: Str)
+    // A Token.
+    SfvToken(s: Str)
+    // A Byte Sequence.
+    SfvBinary(b: Bytes)
+    // A Boolean.
+    SfvBoolean(b: Bool)
+    // A Date: seconds since the Unix epoch.
+    SfvDate(seconds: Int)
+    // A Display String: Unicode text, held as UTF-8.
+    SfvDisplay(s: Str)
+
+// One parameter: a key and a Bare Item.  A parameter written with no `=`
+// has the value `SfvBoolean(true)`.
+pub struct SfvParam
+    key: Str
+    value: SfvBare
+
+// An Item: a Bare Item and its parameters in order.
+pub struct SfvItem
+    value: SfvBare
+    params: [SfvParam]
+
+// An Inner List: Items in order, and the parameters of the list itself.
+pub struct SfvInner
+    items: [SfvItem]
+    params: [SfvParam]
+
+// A member of a List or a Dictionary.
+pub enum SfvMember
+    // An Item.
+    SfvMemberItem(item: SfvItem)
+    // An Inner List.
+    SfvMemberInner(inner: SfvInner)
+
+// One member of a Dictionary, under its key.
+pub struct SfvEntry
+    key: Str
+    member: SfvMember
+
+// ── Building values ──────────────────────────────────────────────────
+
+// An Item with no parameters.
+pub fn item(value: SfvBare) -> SfvItem []
+    let none: [SfvParam] = []
+    SfvItem { value: value, params: none }
+
+// An Item with parameters.
+pub fn item_with(value: SfvBare, params: [SfvParam]) -> SfvItem []
+    SfvItem { value: value, params: params }
+
+// A parameter.
+pub fn param(key: Str, value: SfvBare) -> SfvParam []
+    SfvParam { key: key, value: value }
+
+// A List member that is an Item with no parameters.
+pub fn member(value: SfvBare) -> SfvMember []
+    SfvMemberItem(item(value))
+
+// A Dictionary entry that is an Item with no parameters.
+pub fn entry(key: Str, value: SfvBare) -> SfvEntry []
+    SfvEntry { key: key, member: member(value) }
+
+// An Inner List of Items with the given parameters.
+pub fn inner(items: [SfvItem], params: [SfvParam]) -> SfvInner []
+    SfvInner { items: items, params: params }
+
+// Set a parameter.  A key already present keeps its place and takes the new
+// value; a new key goes at the end.
+pub fn param_set(var params: [SfvParam], key: Str, value: SfvBare) []
+    for i in 0..list.len(params)
+        if params[i].key == key
+            params[i] = SfvParam { key: key, value: value }
+            return
+    list.push(params, SfvParam { key: key, value: value })
+
+// Set a Dictionary entry.  A key already present keeps its place and takes
+// the new member; a new key goes at the end.
+pub fn dict_set(var entries: [SfvEntry], key: Str, member: SfvMember) []
+    for i in 0..list.len(entries)
+        if entries[i].key == key
+            entries[i] = SfvEntry { key: key, member: member }
+            return
+    list.push(entries, SfvEntry { key: key, member: member })
+
+// ── Reading values ───────────────────────────────────────────────────
+
+// The value of a parameter, or `None` when the key is not there.
+pub fn param_get(params: [SfvParam], key: Str) -> ?SfvBare []
+    for p in params
+        if p.key == key
+            return Some(p.value)
+    None
+
+// Whether a parameter is present.
+pub fn param_has(params: [SfvParam], key: Str) -> Bool []
+    for p in params
+        if p.key == key
+            return true
+    false
+
+// The member of a Dictionary under a key, or `None`.
+pub fn dict_get(entries: [SfvEntry], key: Str) -> ?SfvMember []
+    for e in entries
+        if e.key == key
+            return Some(e.member)
+    None
+
+// The Integer in a Bare Item, or `None` if it is another type.
+pub fn as_int(v: SfvBare) -> ?Int []
+    match v
+        SfvInteger(n) => Some(n)
+        _             => None
+
+// The String in a Bare Item, or `None` if it is another type.  A Token is
+// not a String.
+pub fn as_string(v: SfvBare) -> ?Str []
+    match v
+        SfvString(s) => Some(s)
+        _            => None
+
+// The Token in a Bare Item, or `None` if it is another type.
+pub fn as_token(v: SfvBare) -> ?Str []
+    match v
+        SfvToken(s) => Some(s)
+        _           => None
+
+// The Boolean in a Bare Item, or `None` if it is another type.
+pub fn as_bool(v: SfvBare) -> ?Bool []
+    match v
+        SfvBoolean(b) => Some(b)
+        _             => None
+
+// The Byte Sequence in a Bare Item, or `None` if it is another type.
+pub fn as_bytes(v: SfvBare) -> ?Bytes []
+    match v
+        SfvBinary(b) => Some(bytes.clone(b))
+        _            => None
+
+// The Date in a Bare Item, in seconds, or `None` if it is another type.
+pub fn as_date(v: SfvBare) -> ?Int []
+    match v
+        SfvDate(s) => Some(s)
+        _          => None
+
+// The Decimal in a Bare Item, in thousandths, or `None` if it is another
+// type.  An Integer is not a Decimal.
+pub fn as_decimal(v: SfvBare) -> ?Int []
+    match v
+        SfvDecimal(t) => Some(t)
+        _             => None
+
+// ── Decimals ─────────────────────────────────────────────────────────
+
+// The largest magnitude of an Integer, a Decimal in thousandths, or a
+// Date: 15 digits.
+pub const SFV_MAX_DIGITS_VALUE = 999999999999999
+
+// A digit string as an Int, or -1 when it is beyond 15 digits once its
+// leading zeros are gone.
+fn fit(ds: Str) -> Int []
+    var i = 0
+    let n = str.len(ds)
+    while i < n and str.byte_at_or(ds, i, 0) == '0'
+        i = i + 1
+    if n - i > 15
+        return -1
+    var v = 0
+    for j in i..n
+        v = v * 10 + (str.byte_at_or(ds, j, '0') - '0')
+    fit_int(v)
+
+// An Int checked against the 15-digit bound.
+fn fit_int(v: Int) -> Int []
+    if v > SFV_MAX_DIGITS_VALUE
+        return -1
+    v
+
+// The digits of a decimal number, read as thousandths and rounded to the
+// nearest, a tie going to the even digit (section 4.1.5).
+//
+// `digits` holds the mantissa digits with no point, and `scale` is how many
+// of them are after the point, so the number is `digits` / 10^`scale`.  The
+// answer is the number times 1000, as a non-negative Int, or -1 when it is
+// beyond 15 digits.
+fn thousandths_of(digits: Str, scale: Int) -> Int []
+    // Shift so that exactly three digits sit after the point: pad with zeros
+    // when there are fewer, and cut with rounding when there are more.
+    var ds = digits
+    var cut = scale - 3
+    if cut <= 0
+        ds = ds + str.repeat("0", 0 - cut)
+        return fit(ds)
+    // Pad on the left so that there is at least one kept digit, which may be
+    // a zero.
+    if str.len(ds) <= cut
+        ds = str.repeat("0", cut - str.len(ds) + 1) + ds
+    let keep = str.len(ds) - cut
+    let kept = fit(str.slice(ds, 0, keep))
+    if kept < 0
+        return -1
+    let first = str.byte_at_or(ds, keep, '0') - '0'
+    var rest_nonzero = false
+    for i in keep + 1..str.len(ds)
+        if str.byte_at_or(ds, i, '0') != '0'
+            rest_nonzero = true
+    var up = false
+    if first > 5
+        up = true
+    else if first == 5
+        up = rest_nonzero or kept % 2 == 1
+    if up
+        return fit_int(kept + 1)
+    kept
+
+// The thousandths in a decimal string such as `2.5`, `-0.0015` or `1e-3`,
+// rounded half to even at the third fraction digit.
+//
+// Accepts an optional sign, digits with an optional point, and an optional
+// exponent.  Answers `None` for text that is not a number, and for a number
+// whose integer part has more than 12 digits once rounded.
+//
+// ```novo
+// use sfvtypes
+//
+// fn main() [io]
+//     println(string_of_int(sfvtypes.decimal_from_text("0.0025") ?? -1))   // 2
+//     println(string_of_int(sfvtypes.decimal_from_text("2.0005") ?? -1))   // 2000
+// ```
+pub fn decimal_from_text(text: Str) -> ?Int []
+    let n = str.len(text)
+    var i = 0
+    var negative = false
+    if str.byte_at_or(text, 0, 0) == '-'
+        negative = true
+        i = 1
+    else if str.byte_at_or(text, 0, 0) == '+'
+        i = 1
+    var digits = ""
+    var scale = 0
+    var seen_point = false
+    var any_digit = false
+    var stop = false
+    while i < n and not stop
+        let b = str.byte_at_or(text, i, 0)
+        if b >= '0' and b <= '9'
+            digits = digits + str.from_byte(b)
+            any_digit = true
+            if seen_point
+                scale = scale + 1
+            i = i + 1
+        else if b == '.' and not seen_point
+            seen_point = true
+            i = i + 1
+        else
+            stop = true
+    if not any_digit
+        return None
+    if i < n
+        // An exponent: `e` or `E`, an optional sign, digits.
+        let e = str.byte_at_or(text, i, 0)
+        if e != 'e' and e != 'E'
+            return None
+        i = i + 1
+        var eneg = false
+        if str.byte_at_or(text, i, 0) == '-'
+            eneg = true
+            i = i + 1
+        else if str.byte_at_or(text, i, 0) == '+'
+            i = i + 1
+        if i >= n
+            return None
+        var ev = 0
+        for j in i..n
+            let d = str.byte_at_or(text, j, 0)
+            if d < '0' or d > '9'
+                return None
+            ev = ev * 10 + (d - '0')
+            if ev > 400
+                return None
+        if eneg
+            scale = scale + ev
+        else
+            scale = scale - ev
+    let t = thousandths_of(digits, scale)
+    if t < 0
+        return None
+    if negative
+        return Some(0 - t)
+    Some(t)
+
+// The thousandths nearest a `Float`, a tie going to the even digit.
+//
+// The `Float` is read as the shortest decimal string that gives the same
+// double, so `0.5015` is the decimal 0.5015 and rounds to `0.502`, not the
+// binary value 0.50149999999999994.  Answers `None` for infinity, NaN, and a
+// value with more than 12 integer digits.
+pub fn decimal_from_float(f: Float) -> ?Int []
+    decimal_from_text(str.from_float_shortest(f))
+
+// A Decimal Bare Item from a `Float`, or `None` where `decimal_from_float`
+// answers `None`.
+pub fn decimal(f: Float) -> ?SfvBare []
+    match decimal_from_float(f)
+        Some(t) => Some(SfvDecimal(t))
+        None    => None

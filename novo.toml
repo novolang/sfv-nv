@@ -1,0 +1,34 @@
+[package]
+name        = "sfv-nv"
+version     = "0.1.0"
+description = "Structured Field Values for HTTP, RFC 9651: the eight data types (Integer, Decimal, String, Token, Byte Sequence, Boolean, Date, Display String), Items with Parameters, Lists with Inner Lists, and Dictionaries, parsed by the algorithms of section 4.2 with their exact failures and serialised in the canonical forms of section 4.1. Decimals are exact, held as thousandths. Checked against the whole httpwg structured-field-tests corpus."
+license     = "Apache-2.0"
+stability   = "experimental"
+
+# `core`.  A field value is a string the caller already holds, and a parsed
+# value is a tree of enums, structs and lists.  Nothing here reads a clock,
+# a file or a socket, so no function declares an effect.
+#
+# No build for a microcontroller: a parsed Dictionary is a growable list of
+# heap values, and parsing allocates a string for every String, Token and
+# key it reads.
+layer       = "core"
+
+category    = "networking"
+
+tags        = ["structured-fields", "rfc9651", "rfc8941", "http", "headers", "parser", "serializer", "sans-io"]
+repository  = "https://github.com/novolang/sfv-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.23.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "HTTP structured fields, parsed and written exactly as RFC 9651 says"
+
+[dependencies]
+# None.  Base64 for a Byte Sequence is the one thing a standard library
+# call serves, and the decoder is written here because RFC 9651 section
+# 4.2.7 asks a parser not to fail on missing padding or non-zero pad bits,
+# which base64-nv's decoder refuses.

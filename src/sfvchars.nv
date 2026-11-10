@@ -1,0 +1,137 @@
+// sfvchars.nv — the character classes of RFC 9651 and the checks built on
+// them.
+//
+// Structured Field Values is a grammar over ASCII.  Every rule in it is a
+// test on one byte (a digit, a lower-case letter, a `tchar`) or a run of
+// them (a key, a token, a string).  They are gathered here so that the
+// parser and the writer apply the same rule, and so that a caller building
+// a value can ask whether it will serialise before it tries.
+//
+// A byte is an `Int` from 0 to 255, as `str.byte_at_or` answers it.
+
+use std.str
+
+// An ASCII digit, `0` to `9`.
+pub fn is_digit(b: Int) -> Bool []
+    b >= '0' and b <= '9'
+
+// An ASCII letter, upper or lower case.
+pub fn is_alpha(b: Int) -> Bool []
+    b >= 'a' and b <= 'z' or b >= 'A' and b <= 'Z'
+
+// A lower-case ASCII letter, `lcalpha` of RFC 9651 section 3.1.2.
+pub fn is_lcalpha(b: Int) -> Bool []
+    b >= 'a' and b <= 'z'
+
+// A `tchar` of RFC 9110 section 5.6.2: the bytes a token may be made of
+// besides the colon and the slash that RFC 9651 section 3.3.4 adds.
+pub fn is_tchar(b: Int) -> Bool []
+    if is_digit(b) or is_alpha(b)
+        return true
+    b == '!' or b == '#' or b == '$' or b == '%' or b == '&' or b == '\'' or b == '*' or b == '+' or b == '-' or b == '.' or b == '^' or b == '_' or b == '`' or b == '|' or b == '~'
+
+// A byte a key may start with: a lower-case letter or `*`.
+pub fn is_key_start(b: Int) -> Bool []
+    is_lcalpha(b) or b == '*'
+
+// A byte a key may continue with: a lower-case letter, a digit, or one of
+// `_`, `-`, `.` and `*`.
+pub fn is_key_char(b: Int) -> Bool []
+    is_lcalpha(b) or is_digit(b) or b == '_' or b == '-' or b == '.' or b == '*'
+
+// A byte a token may start with: a letter or `*`.
+pub fn is_token_start(b: Int) -> Bool []
+    is_alpha(b) or b == '*'
+
+// A byte a token may continue with: a `tchar`, `:` or `/`.
+pub fn is_token_char(b: Int) -> Bool []
+    is_tchar(b) or b == ':' or b == '/'
+
+// A byte a String may carry unescaped or escaped: printable ASCII,
+// `0x20` to `0x7E`.
+pub fn is_string_char(b: Int) -> Bool []
+    b >= 0x20 and b <= 0x7E
+
+// Whether `s` is a valid key, section 3.1.2: a first byte from
+// `is_key_start` and the rest from `is_key_char`.  The empty string is not
+// a key.
+pub fn valid_key(s: Str) -> Bool []
+    let n = str.len(s)
+    if n == 0
+        return false
+    if not is_key_start(str.byte_at_or(s, 0, 0))
+        return false
+    for i in 1..n
+        if not is_key_char(str.byte_at_or(s, i, 0))
+            return false
+    true
+
+// Whether `s` is a valid Token, section 3.3.4: a first byte from
+// `is_token_start` and the rest from `is_token_char`.  The empty string is
+// not a token.
+pub fn valid_token(s: Str) -> Bool []
+    let n = str.len(s)
+    if n == 0
+        return false
+    if not is_token_start(str.byte_at_or(s, 0, 0))
+        return false
+    for i in 1..n
+        if not is_token_char(str.byte_at_or(s, i, 0))
+            return false
+    true
+
+// Whether `s` can be a String, section 3.3.3: every byte is printable
+// ASCII.  The empty string can.
+pub fn valid_string(s: Str) -> Bool []
+    for i in 0..str.len(s)
+        if not is_string_char(str.byte_at_or(s, i, 0))
+            return false
+    true
+
+// Whether the byte at `i` exists and is a UTF-8 continuation byte,
+// `0x80` to `0xBF`.
+fn is_cont(s: Str, i: Int, n: Int) -> Bool []
+    if i >= n
+        return false
+    let b = str.byte_at_or(s, i, 0)
+    b >= 0x80 and b <= 0xBF
+
+// Whether `s` is well-formed UTF-8, as a Display String needs
+// (section 3.3.8): no overlong form, no surrogate (`U+D800` to `U+DFFF`),
+// nothing above `U+10FFFF`, and no truncated sequence.
+pub fn valid_utf8(s: Str) -> Bool []
+    let n = str.len(s)
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(s, i, 0)
+        if b < 0x80
+            i = i + 1
+        else if b >= 0xC2 and b <= 0xDF
+            if not is_cont(s, i + 1, n)
+                return false
+            i = i + 2
+        else if b >= 0xE0 and b <= 0xEF
+            if not is_cont(s, i + 1, n) or not is_cont(s, i + 2, n)
+                return false
+            let b1 = str.byte_at_or(s, i + 1, 0)
+            // E0 needs A0..BF so the code point is not below U+0800, and ED
+            // needs 80..9F so it is not a surrogate.
+            if b == 0xE0 and b1 < 0xA0
+                return false
+            if b == 0xED and b1 > 0x9F
+                return false
+            i = i + 3
+        else if b >= 0xF0 and b <= 0xF4
+            if not is_cont(s, i + 1, n) or not is_cont(s, i + 2, n) or not is_cont(s, i + 3, n)
+                return false
+            let b1 = str.byte_at_or(s, i + 1, 0)
+            // F0 needs 90..BF so the code point is not below U+10000, and F4
+            // needs 80..8F so it is not above U+10FFFF.
+            if b == 0xF0 and b1 < 0x90
+                return false
+            if b == 0xF4 and b1 > 0x8F
+                return false
+            i = i + 4
+        else
+            return false
+    true

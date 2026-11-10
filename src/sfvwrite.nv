@@ -1,0 +1,278 @@
+// sfvwrite.nv — serialising a field value, RFC 9651 section 4.1.
+//
+// `serialize_item`, `serialize_list` and `serialize_dictionary` write the
+// canonical form of a value, and refuse a value that has none: an Integer
+// of more than 15 digits, a String with a byte outside printable ASCII, a
+// Token or a key that breaks its grammar, a Display String that is not
+// UTF-8.  Everything a successful call answers parses back to the value it
+// was given.
+//
+// An empty List or Dictionary serialises to the empty string.  Section 4.1
+// says such a field is not sent at all, so a caller tests for the empty
+// string and leaves the field out.
+//
+// THE CANONICAL FORMS.  Members are separated by `, ` and the Items of an
+// Inner List by a space.  A Decimal has its fraction digits trimmed of
+// trailing zeros down to one: `2.5`, `10.0`.  A Boolean parameter that is
+// true is written as the key alone.  A Byte Sequence is padded base64.  A
+// String escapes `"` and `\` with a backslash.  A Display String writes
+// every byte that is not printable ASCII, and `%` and `"`, as `%` and two
+// lower-case hexadecimal digits.
+
+use std.bytes
+use std.str
+use sfvchars
+use sfvtypes
+
+// A failed write.
+fn unwritable() -> SfvError []
+    SfvError { code: SFV_ERR_UNWRITABLE, at: -1 }
+
+// A lower-case hexadecimal digit.
+fn hex_digit(v: Int) -> Str []
+    if v < 10
+        return str.from_byte('0' + v)
+    str.from_byte('a' + v - 10)
+
+// The digits of a non-negative Int, left-padded with zeros to `width`.
+fn digits(v: Int, width: Int) -> Str []
+    str.pad_left(str.from_int(v), width, "0")
+
+// The text of a Decimal held as thousandths.
+//
+// The integer part, a point, and the fraction with trailing zeros removed
+// down to one digit.
+fn decimal_text(t: Int) -> Str []
+    var sign = ""
+    var m = t
+    if t < 0
+        sign = "-"
+        m = 0 - t
+    let whole = m / 1000
+    let frac = m % 1000
+    var f = digits(frac, 3)
+    if str.byte_at_or(f, 2, 0) == '0'
+        f = str.slice(f, 0, 2)
+        if str.byte_at_or(f, 1, 0) == '0'
+            f = str.slice(f, 0, 1)
+    sign + str.from_int(whole) + "." + f
+
+// An Integer, Date or Decimal magnitude is within 15 digits.
+fn in_range(n: Int) -> Bool []
+    n >= 0 - SFV_MAX_DIGITS_VALUE and n <= SFV_MAX_DIGITS_VALUE
+
+// Serialise a Bare Item, section 4.1.3.1.
+fn write_bare(v: SfvBare) -> Result<Str, SfvError> []
+    match v
+        SfvInteger(n) =>
+            if not in_range(n)
+                return Err(unwritable())
+            Ok(str.from_int(n))
+        SfvDecimal(t) =>
+            if not in_range(t)
+                return Err(unwritable())
+            Ok(decimal_text(t))
+        SfvString(s)  =>
+            if not sfvchars.valid_string(s)
+                return Err(unwritable())
+            Ok("\"" + escape(s) + "\"")
+        SfvToken(s)   =>
+            if not sfvchars.valid_token(s)
+                return Err(unwritable())
+            Ok(s)
+        SfvBinary(b)  => Ok(":" + bytes.to_base64(b) + ":")
+        SfvBoolean(b) =>
+            if b
+                return Ok("?1")
+            Ok("?0")
+        SfvDate(n)    =>
+            if not in_range(n)
+                return Err(unwritable())
+            Ok("@" + str.from_int(n))
+        SfvDisplay(s) =>
+            if not sfvchars.valid_utf8(s)
+                return Err(unwritable())
+            Ok("%\"" + percent(s) + "\"")
+
+// A String's body with `"` and `\` escaped.
+fn escape(s: Str) -> Str []
+    var out = ""
+    for i in 0..str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        if b == '"' or b == '\\'
+            out = out + "\\"
+        out = out + str.from_byte(b)
+    out
+
+// A Display String's body with the bytes outside printable ASCII, and
+// `%` and `"`, written as `%` and two hexadecimal digits.
+fn percent(s: Str) -> Str []
+    var out = ""
+    for i in 0..str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        if b == '%' or b == '"' or b < 0x20 or b > 0x7E
+            out = out + "%" + hex_digit(b / 16) + hex_digit(b % 16)
+        else
+            out = out + str.from_byte(b)
+    out
+
+// Whether a Bare Item is the Boolean true, which a parameter or a
+// Dictionary member leaves unwritten.
+fn is_true(v: SfvBare) -> Bool []
+    match v
+        SfvBoolean(b) => b
+        _             => false
+
+// Serialise parameters, section 4.1.1.2.
+fn write_params(params: [SfvParam]) -> Result<Str, SfvError> []
+    var out = ""
+    for p in params
+        if not sfvchars.valid_key(p.key)
+            return Err(unwritable())
+        out = out + ";" + p.key
+        if not is_true(p.value)
+            let text = write_bare(p.value)
+            match text
+                Ok(t)  =>
+                    out = out + "=" + t
+                Err(e) =>
+                    return Err(e)
+    Ok(out)
+
+// Serialise an Item, section 4.1.3.
+fn write_item(it: SfvItem) -> Result<Str, SfvError> []
+    let b = write_bare(it.value)
+    match b
+        Err(e)   => Err(e)
+        Ok(text) =>
+            let ps = write_params(it.params)
+            match ps
+                Err(e)    => Err(e)
+                Ok(ptext) => Ok(text + ptext)
+
+// Serialise an Inner List, section 4.1.1.1.
+fn write_inner(inl: SfvInner) -> Result<Str, SfvError> []
+    var out = "("
+    var first = true
+    for it in inl.items
+        let t = write_item(it)
+        match t
+            Err(e)   =>
+                return Err(e)
+            Ok(text) =>
+                if not first
+                    out = out + " "
+                first = false
+                out = out + text
+    let ps = write_params(inl.params)
+    match ps
+        Err(e)    => Err(e)
+        Ok(ptext) => Ok(out + ")" + ptext)
+
+// Serialise a List or Dictionary member.
+fn write_member(m: SfvMember) -> Result<Str, SfvError> []
+    match m
+        SfvMemberItem(it)   => write_item(it)
+        SfvMemberInner(inl) => write_inner(inl)
+
+// Serialise an Item.
+//
+// ```novo
+// use sfvwrite
+// use sfvtypes
+//
+// fn main() [io]
+//     let it = sfvtypes.item_with(SfvToken("gzip"), [sfvtypes.param("q", SfvDecimal(800))])
+//     match sfvwrite.serialize_item(it)
+//         Ok(text) => println(text)   // gzip;q=0.8
+//         Err(_) => println("unwritable")
+// ```
+pub fn serialize_item(it: SfvItem) -> Result<Str, SfvError> []
+    write_item(it)
+
+// Serialise a List.  The empty List is the empty string: the field is not
+// sent.
+//
+// ```novo
+// use sfvwrite
+// use sfvtypes
+//
+// fn main() [io]
+//     match sfvwrite.serialize_list([sfvtypes.member(SfvInteger(1)), sfvtypes.member(SfvToken("a"))])
+//         Ok(text) => println(text)   // 1, a
+//         Err(_) => println("unwritable")
+// ```
+pub fn serialize_list(members: [SfvMember]) -> Result<Str, SfvError> []
+    var out = ""
+    var first = true
+    for m in members
+        let t = write_member(m)
+        match t
+            Err(e)   =>
+                return Err(e)
+            Ok(text) =>
+                if not first
+                    out = out + ", "
+                first = false
+                out = out + text
+    Ok(out)
+
+// Serialise a Dictionary.  The empty Dictionary is the empty string.  A
+// member that is an Item with the value `true` is written as its key and
+// parameters.
+//
+// ```novo
+// use sfvwrite
+// use sfvtypes
+//
+// fn main() [io]
+//     match sfvwrite.serialize_dictionary([sfvtypes.entry("a", SfvInteger(1)), sfvtypes.entry("b", SfvBoolean(true))])
+//         Ok(text) => println(text)   // a=1, b
+//         Err(_) => println("unwritable")
+// ```
+pub fn serialize_dictionary(entries: [SfvEntry]) -> Result<Str, SfvError> []
+    var out = ""
+    var first = true
+    for e in entries
+        if not sfvchars.valid_key(e.key)
+            return Err(unwritable())
+        if not first
+            out = out + ", "
+        first = false
+        out = out + e.key
+        match e.member
+            SfvMemberItem(it)   =>
+                if is_true(it.value)
+                    let ps = write_params(it.params)
+                    match ps
+                        Err(x)    =>
+                            return Err(x)
+                        Ok(ptext) =>
+                            out = out + ptext
+                else
+                    let t = write_item(it)
+                    match t
+                        Err(x)   =>
+                            return Err(x)
+                        Ok(text) =>
+                            out = out + "=" + text
+            SfvMemberInner(inl) =>
+                let t = write_inner(inl)
+                match t
+                    Err(x)   =>
+                        return Err(x)
+                    Ok(text) =>
+                        out = out + "=" + text
+    Ok(out)
+
+// The text of a Decimal held as thousandths, for a caller that wants the
+// digits without building an Item.
+//
+// ```novo
+// use sfvwrite
+//
+// fn main() [io]
+//     println(sfvwrite.decimal_to_str(2500))   // 2.5
+// ```
+pub fn decimal_to_str(thousandths: Int) -> Str []
+    decimal_text(thousandths)
